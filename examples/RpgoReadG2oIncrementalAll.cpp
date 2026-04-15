@@ -5,6 +5,8 @@ author: Yun Chang
 
 #include <gtsam/geometry/Pose2.h>
 #include <gtsam/geometry/Pose3.h>
+#include <gtsam/base/Vector.h>
+#include <gtsam/linear/NoiseModel.h>
 #include <gtsam/slam/dataset.h>
 #include <stdlib.h>
 
@@ -21,26 +23,66 @@ author: Yun Chang
 using namespace KimeraRPGO;
 
 static const size_t kOptimizationBatchSize = 1;
+static const size_t initTimestamp = 10000000000;
+static const size_t dTimestamp = 10000000000;
+
+template <class T>
+const gtsam::SharedNoiseModel& getInitNoiseModel();
+
+template <>
+const gtsam::SharedNoiseModel& getInitNoiseModel<gtsam::Pose2>() {
+  static const gtsam::SharedNoiseModel kInitNoisePose2 =
+      gtsam::noiseModel::Diagonal::Sigmas(
+    (gtsam::Vector(3) << 1e-6, 1e-6, 1e-6).finished());
+  return kInitNoisePose2;
+}
+
+template <>
+const gtsam::SharedNoiseModel& getInitNoiseModel<gtsam::Pose3>() {
+  static const gtsam::SharedNoiseModel kInitNoisePose3 =
+      gtsam::noiseModel::Diagonal::Sigmas(
+    (gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6).finished());
+  return kInitNoisePose3;
+}
 
 /* Helper function to write a single Pose to CSV (template for Pose2/Pose3) */
 template <class T>
-void writePoseToCSV(std::ofstream& file, gtsam::Key key, const T& pose);
+void writePoseToCSV(std::ofstream& file, size_t timestamp, const T& pose);
+
+/* Helper function to normalize rotation for Pose3 and no-op for Pose2 */
+template <class T>
+T normalizePoseRotationIfNeeded(const T& pose);
+
+template <>
+gtsam::Pose3 normalizePoseRotationIfNeeded<gtsam::Pose3>(
+    const gtsam::Pose3& pose) {
+  auto quat = pose.rotation().toQuaternion();
+  quat.normalize();
+  return gtsam::Pose3(gtsam::Rot3::Quaternion(quat.w(), quat.x(), quat.y(), quat.z()),
+                      pose.translation());
+}
+
+template <>
+gtsam::Pose2 normalizePoseRotationIfNeeded<gtsam::Pose2>(
+    const gtsam::Pose2& pose) {
+  return pose;
+}
 
 /* Specialization for Pose3 */
 template <>
-void writePoseToCSV<gtsam::Pose3>(std::ofstream& file, gtsam::Key key, const gtsam::Pose3& pose) {
+void writePoseToCSV<gtsam::Pose3>(std::ofstream& file, size_t timestamp, const gtsam::Pose3& pose) {
   gtsam::Point3 position = pose.translation();
   auto quat = pose.rotation().toQuaternion();
-  file << "0," << position.x() << "," << position.y() << "," << position.z() 
+  file << timestamp << "," << position.x() << "," << position.y() << "," << position.z()
        << "," << quat.w() << "," << quat.x() << "," << quat.y() << "," << quat.z() << "\n";
 }
 
 /* Specialization for Pose2 */
 template <>
-void writePoseToCSV<gtsam::Pose2>(std::ofstream& file, gtsam::Key key, const gtsam::Pose2& pose) {
+void writePoseToCSV<gtsam::Pose2>(std::ofstream& file, size_t timestamp, const gtsam::Pose2& pose) {
   gtsam::Point2 position = pose.translation();
   double theta = pose.theta();
-  file << "0," << position.x() << "," << position.y() << "," << theta << "\n";
+  file << timestamp << "," << position.x() << "," << position.y() << "," << theta << "\n";
 }
 
 /* Helper function to write all poses to CSV (template for Pose2/Pose3) */
@@ -52,12 +94,14 @@ template <>
 void writeAllPosesToCSV<gtsam::Pose3>(const std::string& filename, const gtsam::Values& values) {
   std::ofstream output(filename);
   output << "#timestamp,p_RS_R_x [m],p_RS_R_y [m],p_RS_R_z [m],q_RS_w [],q_RS_x [],q_RS_y [],q_RS_z []\n";
-  
+
+  size_t timestamp = initTimestamp;
   for (size_t i = 0; i < values.keys().size(); i++) {
     gtsam::Key key = values.keys()[i];
     try {
       const gtsam::Pose3& pose = values.at<gtsam::Pose3>(key);
-      writePoseToCSV<gtsam::Pose3>(output, key, pose);
+      writePoseToCSV<gtsam::Pose3>(output, timestamp, pose);
+      timestamp += dTimestamp;
     } catch (const std::exception& e) {
       // Skip non-Pose3 values
     }
@@ -70,12 +114,14 @@ template <>
 void writeAllPosesToCSV<gtsam::Pose2>(const std::string& filename, const gtsam::Values& values) {
   std::ofstream output(filename);
   output << "#timestamp,p_RS_R_x [m],p_RS_R_y [m],theta [rad]\n";
-  
+
+  size_t timestamp = initTimestamp;
   for (size_t i = 0; i < values.keys().size(); i++) {
     gtsam::Key key = values.keys()[i];
     try {
       const gtsam::Pose2& pose = values.at<gtsam::Pose2>(key);
-      writePoseToCSV<gtsam::Pose2>(output, key, pose);
+      writePoseToCSV<gtsam::Pose2>(output, timestamp, pose);
+      timestamp += dTimestamp;
     } catch (const std::exception& e) {
       // Skip non-Pose2 values
     }
@@ -84,10 +130,10 @@ void writeAllPosesToCSV<gtsam::Pose2>(const std::string& filename, const gtsam::
 }
 
 /* Helper function to write a single Pose3 to CSV */
-void writePose3ToCSV(std::ofstream& file, gtsam::Key key, const gtsam::Pose3& pose) {
+void writePose3ToCSV(std::ofstream& file, size_t timestamp, const gtsam::Pose3& pose) {
   gtsam::Point3 position = pose.translation();
   auto quat = pose.rotation().toQuaternion();
-  file << "0," << position.x() << "," << position.y() << "," << position.z() 
+  file << timestamp << "," << position.x() << "," << position.y() << "," << position.z()
        << "," << quat.w() << "," << quat.x() << "," << quat.y() << "," << quat.z() << "\n";
 }
 
@@ -95,12 +141,14 @@ void writePose3ToCSV(std::ofstream& file, gtsam::Key key, const gtsam::Pose3& po
 void writeAllPoses3ToCSV(const std::string& filename, const gtsam::Values& values) {
   std::ofstream output(filename);
   output << "#timestamp,p_RS_R_x [m],p_RS_R_y [m],p_RS_R_z [m],q_RS_w [],q_RS_x [],q_RS_y [],q_RS_z []\n";
-  
+
+  size_t timestamp = initTimestamp;
   for (size_t i = 0; i < values.keys().size(); i++) {
     gtsam::Key key = values.keys()[i];
     try {
       const gtsam::Pose3& pose = values.at<gtsam::Pose3>(key);
-      writePose3ToCSV(output, key, pose);
+      writePose3ToCSV(output, timestamp, pose);
+      timestamp += dTimestamp;
     } catch (const std::exception& e) {
       // Skip non-Pose3 values
     }
@@ -122,12 +170,7 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
 
   std::unique_ptr<RobustSolver> pgo =
       KimeraRPGO::make_unique<RobustSolver>(params);
-
-  size_t dim = getDim<T>();
-
-  Eigen::VectorXd noise = Eigen::VectorXd::Zero(dim);
-  static const gtsam::SharedNoiseModel& init_noise =
-      gtsam::noiseModel::Diagonal::Sigmas(noise);
+    const gtsam::SharedNoiseModel& init_noise = getInitNoiseModel<T>();
 
   gtsam::Key current_key = nfg[0]->front();
 
@@ -157,40 +200,43 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
   // Add non lc factors one by one, checking for applicable loop closures
   std::vector<bool> lc_used(lc_factors.size(), false);
   size_t lc_added = 0;
-  
+
   // Initialize incremental trajectory CSV
   std::string incremental_csv = output_folder + "/incremental_trajectory.csv";
   std::ofstream incremental_file(incremental_csv);
   incremental_file << "#timestamp,p_RS_R_x [m],p_RS_R_y [m],p_RS_R_z [m],q_RS_w [],q_RS_x [],q_RS_y [],q_RS_z []\n";
-  
+
+  size_t timestamp = initTimestamp;
+
   // Write initial pose
   const T& init_pose = values.at<T>(current_key);
-  writePoseToCSV(incremental_file, current_key, init_pose);
+  writePoseToCSV(incremental_file, timestamp, init_pose);
+  timestamp += dTimestamp;
   incremental_file.flush();
 
   // Bootstrap the solver with the first node and a prior.
-  pgo->update(init_factors, init_values, true);
-  
+  pgo->update(init_factors, init_values);
+
   for (size_t i = 0; i < non_lc_factors.size(); ++i) {
     const auto& non_lc_factor = non_lc_factors[i];
     gtsam::NonlinearFactorGraph new_nonlc_factors;
     new_nonlc_factors.add(non_lc_factor);
     gtsam::Values new_nonlc_values;
-    
+
     // Get the max key from the non-LC factor
     gtsam::Key non_lc_max_key = std::max(non_lc_factor->front(), non_lc_factor->back());
 
     size_t lc_added_this_iter = 0;
     gtsam::NonlinearFactorGraph new_lc_factors;
-    
+
     // Check all remaining LC factors for those to add
     for (size_t j = 0; j < lc_factors.size(); ++j) {
       if (lc_used[j]) continue;
-      
+
       const auto& lc_factor = lc_factors[j];
       gtsam::Key lc_from = lc_factor->front();
       gtsam::Key lc_to = lc_factor->back();
-      
+
       // Add if both indices are <= the current non-LC max key
       if (lc_from <= non_lc_max_key && lc_to <= non_lc_max_key) {
         new_lc_factors.add(lc_factor);
@@ -200,7 +246,7 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
     }
 
     lc_added += lc_added_this_iter;
-    
+
     // Optimize every configured batch of loop closures, and also on the final remaining batch.
     bool optimize_graph = (lc_added_this_iter > 0 && lc_added_this_iter % kOptimizationBatchSize == 0) ||
                           (i + 1 == non_lc_factors.size());
@@ -217,7 +263,9 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
         const T& last_estimated_pose = current_estimates.at<T>(from_key);
         const T initialized_pose =
             last_estimated_pose.compose(odom_factor->measured());
-        new_nonlc_values.insert(to_key, initialized_pose);
+        const T normalized_pose =
+            normalizePoseRotationIfNeeded<T>(initialized_pose);
+        new_nonlc_values.insert(to_key, normalized_pose);
       }
     }
 
@@ -225,24 +273,25 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
     if (new_lc_factors.size() > 0) {
       pgo->update(new_lc_factors, gtsam::Values(), optimize_graph);
     }
-    
+
     // Write the latest pose
     gtsam::Values current_estimates = pgo->calculateEstimate();
     try {
       const T& most_recent_pose = current_estimates.at<T>(non_lc_max_key);
-      writePoseToCSV(incremental_file, non_lc_max_key, most_recent_pose);
+      writePoseToCSV(incremental_file, timestamp, most_recent_pose);
+      timestamp += dTimestamp;
       incremental_file.flush();
     } catch (const std::exception& e) {
       // Skip if pose cannot be extracted
     }
   }
-  
+
   incremental_file.close();
-  
+
   pgo->saveData(output_folder);  // tell pgo to save g2o result
-  
+
   // Write final trajectory to batch CSV
-  std::string batch_csv = output_folder + "/final_trajectory.csv";
+  std::string batch_csv = output_folder + "/batch_trajectory.csv";
   gtsam::Values final_estimates = pgo->calculateEstimate();
   writeAllPosesToCSV<T>(batch_csv, final_estimates);
 }
