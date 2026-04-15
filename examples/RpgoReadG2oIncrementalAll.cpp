@@ -20,6 +20,8 @@ author: Yun Chang
 
 using namespace KimeraRPGO;
 
+static const size_t kOptimizationBatchSize = 1;
+
 /* Helper function to write a single Pose to CSV (template for Pose2/Pose3) */
 template <class T>
 void writePoseToCSV(std::ofstream& file, gtsam::Key key, const T& pose);
@@ -28,7 +30,7 @@ void writePoseToCSV(std::ofstream& file, gtsam::Key key, const T& pose);
 template <>
 void writePoseToCSV<gtsam::Pose3>(std::ofstream& file, gtsam::Key key, const gtsam::Pose3& pose) {
   gtsam::Point3 position = pose.translation();
-  gtsam::Quaternion quat = pose.rotation().toQuaternion();
+  auto quat = pose.rotation().toQuaternion();
   file << "0," << position.x() << "," << position.y() << "," << position.z() 
        << "," << quat.w() << "," << quat.x() << "," << quat.y() << "," << quat.z() << "\n";
 }
@@ -84,7 +86,7 @@ void writeAllPosesToCSV<gtsam::Pose2>(const std::string& filename, const gtsam::
 /* Helper function to write a single Pose3 to CSV */
 void writePose3ToCSV(std::ofstream& file, gtsam::Key key, const gtsam::Pose3& pose) {
   gtsam::Point3 position = pose.translation();
-  gtsam::Quaternion quat = pose.rotation().toQuaternion();
+  auto quat = pose.rotation().toQuaternion();
   file << "0," << position.x() << "," << position.y() << "," << position.z() 
        << "," << quat.w() << "," << quat.x() << "," << quat.y() << "," << quat.z() << "\n";
 }
@@ -134,7 +136,7 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
   init_values.insert(current_key, values.at<T>(current_key));
   gtsam::PriorFactor<T> prior_factor(
       current_key, values.at<T>(current_key), init_noise);
-  nfg.add(prior_factor);
+  init_factors.add(prior_factor);
 
   // separate to non loop closures and loop closure factors
   gtsam::NonlinearFactorGraph non_lc_factors, lc_factors;
@@ -154,6 +156,7 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
   }
   // Add non lc factors one by one, checking for applicable loop closures
   std::vector<bool> lc_used(lc_factors.size(), false);
+  size_t lc_added = 0;
   
   // Initialize incremental trajectory CSV
   std::string incremental_csv = output_folder + "/incremental_trajectory.csv";
@@ -164,14 +167,21 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
   const T& init_pose = values.at<T>(current_key);
   writePoseToCSV(incremental_file, current_key, init_pose);
   incremental_file.flush();
+
+  // Bootstrap the solver with the first node and a prior.
+  pgo->update(init_factors, init_values, true);
   
   for (size_t i = 0; i < non_lc_factors.size(); ++i) {
     const auto& non_lc_factor = non_lc_factors[i];
-    gtsam::NonlinearFactorGraph new_factors;
-    new_factors.add(non_lc_factor);
+    gtsam::NonlinearFactorGraph new_nonlc_factors;
+    new_nonlc_factors.add(non_lc_factor);
+    gtsam::Values new_nonlc_values;
     
     // Get the max key from the non-LC factor
     gtsam::Key non_lc_max_key = std::max(non_lc_factor->front(), non_lc_factor->back());
+
+    size_t lc_added_this_iter = 0;
+    gtsam::NonlinearFactorGraph new_lc_factors;
     
     // Check all remaining LC factors for those to add
     for (size_t j = 0; j < lc_factors.size(); ++j) {
@@ -183,19 +193,40 @@ void SimulateIncremental(gtsam::GraphAndValues gv,
       
       // Add if both indices are <= the current non-LC max key
       if (lc_from <= non_lc_max_key && lc_to <= non_lc_max_key) {
-        new_factors.add(lc_factor);
+        new_lc_factors.add(lc_factor);
         lc_used[j] = true;
+        ++lc_added_this_iter;
       }
     }
+
+    lc_added += lc_added_this_iter;
     
+    // Optimize every configured batch of loop closures, and also on the final remaining batch.
+    bool optimize_graph = (lc_added_this_iter > 0 && lc_added_this_iter % kOptimizationBatchSize == 0) ||
+                          (i + 1 == non_lc_factors.size());
+
     // Update with this non-LC and any matching LCs
-    if (i == 0) {
-      pgo->update(new_factors, values);
-    } else {
-      pgo->update(new_factors, gtsam::Values(), false);
+    if (factor_is_underlying_type<gtsam::BetweenFactor<T>>(non_lc_factor)) {
+      auto odom_factor =
+          factor_pointer_cast<gtsam::BetweenFactor<T>>(non_lc_factor);
+      const gtsam::Key from_key = odom_factor->front();
+      const gtsam::Key to_key = odom_factor->back();
+
+      gtsam::Values current_estimates = pgo->calculateEstimate();
+      if (current_estimates.exists(from_key) && !current_estimates.exists(to_key)) {
+        const T& last_estimated_pose = current_estimates.at<T>(from_key);
+        const T initialized_pose =
+            last_estimated_pose.compose(odom_factor->measured());
+        new_nonlc_values.insert(to_key, initialized_pose);
+      }
+    }
+
+    pgo->update(new_nonlc_factors, new_nonlc_values);
+    if (new_lc_factors.size() > 0) {
+      pgo->update(new_lc_factors, gtsam::Values(), optimize_graph);
     }
     
-    // Extract most recent pose and write to incremental CSV
+    // Write the latest pose
     gtsam::Values current_estimates = pgo->calculateEstimate();
     try {
       const T& most_recent_pose = current_estimates.at<T>(non_lc_max_key);

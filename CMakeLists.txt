@@ -56,6 +56,8 @@ add_executable(RpgoReadG2o examples/RpgoReadG2o.cpp)
 target_link_libraries(RpgoReadG2o KimeraRPGO)
 add_executable(RpgoReadG2oIncremental examples/RpgoReadG2oIncremental.cpp)
 target_link_libraries(RpgoReadG2oIncremental KimeraRPGO)
+add_executable(RpgoReadG2oIncrementalAll examples/RpgoReadG2oIncrementalAll.cpp)
+target_link_libraries(RpgoReadG2oIncrementalAll KimeraRPGO)
 add_executable(GenerateTrajectories examples/GenerateTrajectories.cpp)
 target_link_libraries(GenerateTrajectories gtsam)
 
